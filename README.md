@@ -53,10 +53,10 @@ transport for remote or multi-client setups:
 
 ```bash
 # Streamable HTTP (recommended for network access)
-mkdocs-mcp --transport streamable-http --host 0.0.0.0 --port 9000
+papermoon-mkdocs-mcp --transport streamable-http --host 0.0.0.0 --port 9000
 
 # SSE (legacy client compatibility)
-mkdocs-mcp --transport sse --port 8080
+papermoon-mkdocs-mcp --transport sse --port 8080
 ```
 
 | Flag            | Default       | Description                                      |
