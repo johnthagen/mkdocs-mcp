@@ -308,7 +308,10 @@ def main() -> None:
         global _config_path_override
         _config_path_override = args.config
 
-    run_kwargs: dict[str, Any] = {"transport": args.transport}
+    run_kwargs: dict[str, Any] = {
+        "transport": args.transport,
+        "show_banner": False,
+    }
     if args.transport != "stdio":
         run_kwargs["host"] = args.host
         run_kwargs["port"] = args.port
