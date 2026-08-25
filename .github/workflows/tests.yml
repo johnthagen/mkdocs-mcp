@@ -76,3 +76,86 @@ jobs:
 
       - name: Run ruff
         run: ruff check src tests
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Build the distributions and prove the artifact actually works
+  #
+  # The suite runs with pytest's `pythonpath = ["src"]`, so it imports from the
+  # source tree and passes even when the built wheel is empty — which is
+  # exactly how a wheel containing nothing but .dist-info metadata shipped
+  # unnoticed. This job installs the wheel into a clean environment and
+  # exercises it there, so a packaging regression fails CI instead of a
+  # release.
+  # ---------------------------------------------------------------------------
+  package:
+    name: build and verify distributions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Assert the distributions contain the package
+        shell: python
+        run: |
+          import glob, sys, tarfile, zipfile
+
+          wheel = glob.glob("dist/*.whl")[0]
+          modules = [
+              n for n in zipfile.ZipFile(wheel).namelist()
+              if n.startswith("mkdocs_mcp/") and n.endswith(".py")
+          ]
+          print(f"{wheel}: {len(modules)} module(s)")
+          if not modules:
+              print("::error::wheel contains no mkdocs_mcp modules — check [tool.hatch.build.targets.wheel]")
+              sys.exit(1)
+
+          sdist = glob.glob("dist/*.tar.gz")[0]
+          sources = [
+              n for n in tarfile.open(sdist).getnames()
+              if "/src/mkdocs_mcp/" in n and n.endswith(".py")
+          ]
+          print(f"{sdist}: {len(sources)} module(s)")
+          if not sources:
+              print("::error::sdist contains no mkdocs_mcp sources")
+              sys.exit(1)
+
+      - name: Install the wheel into a clean environment
+        run: |
+          python -m venv /tmp/wheel-env
+          /tmp/wheel-env/bin/python -m pip install --upgrade pip
+          /tmp/wheel-env/bin/python -m pip install dist/*.whl pytest pytest-asyncio numpy
+
+      - name: Import every module from the installed wheel
+        run: |
+          /tmp/wheel-env/bin/python - <<'PY'
+          import importlib
+          for name in (
+              "config", "exclusions", "indexer", "models",
+              "repository", "searcher", "server", "utils",
+          ):
+              module = importlib.import_module(f"mkdocs_mcp.{name}")
+              assert "site-packages" in module.__file__, module.__file__
+          print("all modules import from site-packages")
+          PY
+
+      - name: Run the console entry point
+        run: /tmp/wheel-env/bin/papermoon-mkdocs-mcp --help
+
+      - name: Run the test suite against the installed package
+        # Clearing pythonpath stops pytest putting src/ ahead of site-packages,
+        # so this exercises the shipped artifact rather than the source tree.
+        run: /tmp/wheel-env/bin/python -m pytest -q --override-ini "pythonpath="

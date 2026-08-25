@@ -261,6 +261,43 @@ jobs:
           pip install build
           python -m build
 
+      # A misconfigured build target produces a wheel of pure .dist-info
+      # metadata with no code in it, and the test suite cannot catch that
+      # because it imports from src/. Publishing to PyPI is irreversible —
+      # a version number cannot be reused — so verify before uploading.
+      - name: Assert the distributions contain the package
+        shell: python
+        run: |
+          import glob, sys, tarfile, zipfile
+
+          wheel = glob.glob("dist/*.whl")[0]
+          modules = [
+              n for n in zipfile.ZipFile(wheel).namelist()
+              if n.startswith("mkdocs_mcp/") and n.endswith(".py")
+          ]
+          print(f"{wheel}: {len(modules)} module(s)")
+          if not modules:
+              print("::error::wheel contains no mkdocs_mcp modules — refusing to publish")
+              sys.exit(1)
+
+          sdist = glob.glob("dist/*.tar.gz")[0]
+          sources = [
+              n for n in tarfile.open(sdist).getnames()
+              if "/src/mkdocs_mcp/" in n and n.endswith(".py")
+          ]
+          print(f"{sdist}: {len(sources)} module(s)")
+          if not sources:
+              print("::error::sdist contains no mkdocs_mcp sources — refusing to publish")
+              sys.exit(1)
+
+      - name: Smoke-test the built wheel
+        run: |
+          python -m venv /tmp/release-check
+          /tmp/release-check/bin/python -m pip install --quiet --upgrade pip
+          /tmp/release-check/bin/python -m pip install --quiet dist/*.whl
+          /tmp/release-check/bin/python -c "import mkdocs_mcp.server"
+          /tmp/release-check/bin/papermoon-mkdocs-mcp --help
+
       - name: Upload distributions
         uses: actions/upload-artifact@v7
         with:

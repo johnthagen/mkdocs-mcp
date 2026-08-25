@@ -44,10 +44,13 @@ dev = [
 papermoon-mkdocs-mcp = "mkdocs_mcp.server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["mkdocs_mcp"]
-
-[tool.hatch.build]
-sources = ["src"]
+# Must be the real on-disk path. A bare "mkdocs_mcp" resolves relative to the
+# project root, where no such directory exists, and hatchling then builds a
+# wheel containing only .dist-info metadata and no code at all. The previous
+# [tool.hatch.build] sources = ["src"] did not rescue it: sources rewrites the
+# paths of files already selected for inclusion, it does not tell the wheel
+# target where to look.
+packages = ["src/mkdocs_mcp"]
 
 [tool.ruff]
 line-length = 100
