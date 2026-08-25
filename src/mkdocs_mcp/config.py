@@ -19,8 +19,9 @@ class _SafeMkDocsLoader(yaml.SafeLoader):
     """YAML loader that tolerates mkdocs-specific tags without executing them.
 
     Real-world mkdocs.yml files use:
-    - !!python/name:module.func  (mkdocs-material emoji extensions)
-    - !ENV [VAR, default]        (mkdocs environment variables)
+    - !!python/name:module.func            (mkdocs-material emoji extensions)
+    - !!python/object/apply:module.func    (pymdownx.slugs.slugify)
+    - !ENV [VAR, default]                  (mkdocs environment variables)
 
     yaml.safe_load() rejects these. This loader returns them as plain strings
     or their default values — safe, no code execution.
@@ -28,12 +29,23 @@ class _SafeMkDocsLoader(yaml.SafeLoader):
 
 
 def _handle_python_name(loader: yaml.Loader, suffix: str, node: yaml.Node) -> str:
-    """Convert !!python/name:X to the string 'X' (no execution).
+    """Convert any !!python/... tag to the dotted path it names, as a string.
 
-    For !!python/name:module.func, the module path is entirely in the suffix.
-    The scalar value is always empty for these tags.
+    Registered against the whole ``tag:yaml.org,2002:python/`` prefix, so
+    ``suffix`` carries the tag kind as well as the dotted path:
+
+        !!python/name:module.func          -> suffix 'name:module.func'
+        !!python/object/apply:module.func  -> suffix 'object/apply:module.func'
+
+    Splitting on the first ':' yields the dotted path in both cases.
+
+    ``node`` is deliberately never touched. Nothing is imported, resolved or
+    called, and the node's children are never constructed — so the arguments
+    of an !!python/object/apply: node are inert. This is what makes registering
+    the whole python/ prefix safe: the handler is a pure string stub, not a
+    name resolver.
     """
-    return suffix
+    return suffix.partition(":")[2] or suffix
 
 
 def _handle_env_tag(loader: yaml.Loader, node: yaml.Node) -> Any:
@@ -45,9 +57,15 @@ def _handle_env_tag(loader: yaml.Loader, node: yaml.Node) -> Any:
     return loader.construct_scalar(node)  # type: ignore[arg-type]
 
 
-# Register handlers for mkdocs-specific tags
+# Register handlers for mkdocs-specific tags.
+#
+# A single prefix registration covers the whole !!python/... namespace —
+# name:, module:, object:, object/apply:, object/new: — rather than an
+# enumeration that has to be extended every time a theme uses a new one.
+# Safe only because _handle_python_name is a pure stub; see its docstring.
+# Core tags (!!str, !!int, ...) do not match this prefix and are unaffected.
 _SafeMkDocsLoader.add_multi_constructor(
-    "tag:yaml.org,2002:python/name:", _handle_python_name
+    "tag:yaml.org,2002:python/", _handle_python_name
 )
 _SafeMkDocsLoader.add_constructor("!ENV", _handle_env_tag)
 

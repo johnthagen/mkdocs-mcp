@@ -5,9 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from mkdocs_mcp.config import (
     MkDocsConfig,
+    _SafeMkDocsLoader,
     _extract_plugin_names,
     _title_from_path,
     find_config_file,
@@ -912,3 +914,154 @@ class TestPolkadotConfig:
         """Config with awesome-nav plugin reads nav from .nav.yml files."""
         assert "awesome-nav" in polkadot_config.plugins
         assert len(polkadot_config.nav) > 0
+
+
+# ---------------------------------------------------------------------------
+# Tolerant YAML loader: !!python/... and !ENV tags
+# ---------------------------------------------------------------------------
+
+
+# A realistic mkdocs-material config using BOTH python tags in their natural
+# shapes: emoji_index as a plain scalar !!python/name:, and slugify as an
+# !!python/object/apply: whose node is a *mapping* (kwds:), not a scalar.
+# This is the shape reported in the upstream bug report.
+_MATERIAL_CONFIG = """\
+site_name: Material Site
+theme:
+  name: material
+markdown_extensions:
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.tabbed:
+      alternate_style: true
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - toc:
+      slugify: !!python/object/apply:pymdownx.slugs.slugify {kwds: {case: lower}}
+"""
+
+
+class TestTolerantYamlLoader:
+    """The loader must accept real Material configs without resolving names."""
+
+    def test_material_config_with_both_python_tags(self, tmp_path: Path) -> None:
+        """A realistic Material config with both tags parses end to end."""
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "index.md").write_text("# Home\n", encoding="utf-8")
+        (tmp_path / "mkdocs.yml").write_text(_MATERIAL_CONFIG, encoding="utf-8")
+
+        config = MkDocsConfig.from_file(tmp_path / "mkdocs.yml")
+
+        assert config.site_name == "Material Site"
+        assert config.theme_name == "material"
+
+    def test_python_tags_become_bare_dotted_paths(self) -> None:
+        """Both tag kinds yield the dotted path only — no 'name:'/'object/apply:'."""
+        raw = yaml.load(_MATERIAL_CONFIG, Loader=_SafeMkDocsLoader)
+        emoji = raw["markdown_extensions"][0]["pymdownx.emoji"]
+        tabbed = raw["markdown_extensions"][1]["pymdownx.tabbed"]
+        toc = raw["markdown_extensions"][2]["toc"]
+
+        assert emoji["emoji_index"] == "material.extensions.emoji.twemoji"
+        assert emoji["emoji_generator"] == "material.extensions.emoji.to_svg"
+        # Block-mapping form (the reported bug) and flow-mapping form alike.
+        assert tabbed["slugify"] == "pymdownx.slugs.slugify"
+        assert toc["slugify"] == "pymdownx.slugs.slugify"
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            pytest.param("x: !!python/name:os.system", id="scalar"),
+            pytest.param('x: !!python/object/apply:os.system ["true"]', id="seq_flow"),
+            pytest.param('x: !!python/object/apply:os.system\n  - "true"\n', id="seq_block"),
+            pytest.param('x: !!python/object/apply:os.system\n  args: ["true"]\n', id="map_args"),
+            pytest.param("x: !!python/object/apply:os.system", id="empty_scalar"),
+            pytest.param("x: !!python/module:os", id="module"),
+            pytest.param('x: !!python/object/new:os.system ["true"]', id="object_new"),
+        ],
+    )
+    def test_every_node_shape_yields_a_string(self, source: str) -> None:
+        """The handler ignores the node, so mapping/sequence/scalar all work."""
+        value = yaml.load(source, Loader=_SafeMkDocsLoader)["x"]
+
+        assert isinstance(value, str)
+        assert value == "os" if "module" in source else value == "os.system"
+
+    def test_hostile_payload_does_not_import_or_call(self, monkeypatch) -> None:
+        """!!python/object/apply:os.system ["true"] must not import or execute.
+
+        This is the canonical PyYAML RCE primitive. Trip-wire every route by
+        which the dotted path could be resolved or invoked, then assert the
+        payload parses to an inert string with no trip-wire fired.
+        """
+        import builtins
+        import importlib
+        import os
+        import subprocess
+
+        tripped: list[tuple[str, str]] = []
+
+        real_import_module = importlib.import_module
+        real_import = builtins.__import__
+
+        def spy_import_module(name, *args, **kwargs):
+            tripped.append(("importlib.import_module", name))
+            return real_import_module(name, *args, **kwargs)
+
+        def spy_import(name, *args, **kwargs):
+            if name.split(".")[0] in {"os", "subprocess", "pty", "posix"}:
+                tripped.append(("__import__", name))
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib, "import_module", spy_import_module)
+        monkeypatch.setattr(builtins, "__import__", spy_import)
+        monkeypatch.setattr(os, "system", lambda cmd: tripped.append(("os.system", cmd)))
+        monkeypatch.setattr(os, "popen", lambda cmd, *a: tripped.append(("os.popen", cmd)))
+        monkeypatch.setattr(
+            subprocess, "Popen", lambda *a, **k: tripped.append(("subprocess.Popen", str(a)))
+        )
+
+        payload = (
+            'site_name: Hostile\n'
+            'evil_a: !!python/object/apply:os.system ["true"]\n'
+            'evil_b: !!python/object/apply:subprocess.Popen [["true"]]\n'
+            'evil_c: !!python/name:os.system\n'
+        )
+        raw = yaml.load(payload, Loader=_SafeMkDocsLoader)
+
+        assert tripped == [], f"loader resolved or invoked something: {tripped}"
+        assert raw["evil_a"] == "os.system"
+        assert raw["evil_b"] == "subprocess.Popen"
+        assert raw["evil_c"] == "os.system"
+        # Inert strings, not callables or process handles.
+        assert all(isinstance(raw[k], str) for k in ("evil_a", "evil_b", "evil_c"))
+
+    def test_apply_arguments_are_never_constructed(self) -> None:
+        """The args of an object/apply node are dropped, not evaluated."""
+        raw = yaml.load(
+            'x: !!python/object/apply:shutil.rmtree ["/"]\n', Loader=_SafeMkDocsLoader
+        )
+
+        assert raw["x"] == "shutil.rmtree"
+
+    def test_core_tags_are_unaffected_by_prefix_registration(self) -> None:
+        """Registering the python/ prefix must not shadow !!str, !!int, etc."""
+        raw = yaml.load("a: !!str 5\nb: !!int 7\nc: !!bool yes\n", Loader=_SafeMkDocsLoader)
+
+        assert raw == {"a": "5", "b": 7, "c": True}
+
+    def test_env_tag_returns_default_not_environment_value(self, monkeypatch) -> None:
+        """!ENV must never read os.environ — it returns the declared default."""
+        monkeypatch.setenv("MKDOCS_MCP_SECRET", "s3cret-token")
+
+        raw = yaml.load(
+            "a: !ENV [MKDOCS_MCP_SECRET, fallback]\nb: !ENV MKDOCS_MCP_SECRET\n",
+            Loader=_SafeMkDocsLoader,
+        )
+
+        assert raw["a"] == "fallback"
+        assert raw["b"] == "MKDOCS_MCP_SECRET"  # the name, never the value
+        assert "s3cret-token" not in str(raw)
