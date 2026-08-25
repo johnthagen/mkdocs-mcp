@@ -8,6 +8,7 @@ from typing import Any
 
 import yaml
 
+from mkdocs_mcp.exclusions import ExclusionRules
 from mkdocs_mcp.models import NavItem
 from mkdocs_mcp.utils import is_path_contained
 
@@ -65,6 +66,7 @@ class MkDocsConfig:
     nav: list[NavItem] = field(default_factory=list)
     plugins: list[str] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
+    exclusions: ExclusionRules = field(default_factory=ExclusionRules)
 
     @classmethod
     def detect(cls, start_path: Path | None = None) -> MkDocsConfig:
@@ -137,14 +139,19 @@ class MkDocsConfig:
         if not isinstance(extra, dict):
             extra = {}
 
+        # Documents to keep off the MCP surface entirely
+        exclusions = ExclusionRules.from_config(raw.get("mcp_exclude"))
+
         # Navigation: explicit nav in mkdocs.yml always wins, then fall back
-        # to .nav.yml files if awesome-nav plugin is used, then dir listing
+        # to .nav.yml files if awesome-nav plugin is used, then dir listing.
+        # Every branch filters through the same rules so the nav tree agrees
+        # with the search index.
         if "nav" in raw and isinstance(raw["nav"], list):
-            nav = parse_mkdocs_nav(raw["nav"], docs_dir)
+            nav = parse_mkdocs_nav(raw["nav"], docs_dir, exclusions)
         elif "awesome-nav" in plugins and docs_dir.is_dir():
-            nav = parse_nav_yml(docs_dir)
+            nav = parse_nav_yml(docs_dir, exclusions=exclusions)
         else:
-            nav = _nav_from_directory(docs_dir)
+            nav = _nav_from_directory(docs_dir, exclusions=exclusions)
 
         return cls(
             config_path=config_path,
@@ -156,6 +163,7 @@ class MkDocsConfig:
             nav=nav,
             plugins=plugins,
             extra=extra,
+            exclusions=exclusions,
         )
 
 
@@ -179,7 +187,9 @@ def find_config_file(start_path: Path) -> Path | None:
 
 
 def parse_nav_yml(
-    docs_dir: Path, rel_dir: Path | None = None
+    docs_dir: Path,
+    rel_dir: Path | None = None,
+    exclusions: ExclusionRules | None = None,
 ) -> list[NavItem]:
     """Recursively parse .nav.yml files to build navigation tree.
 
@@ -196,78 +206,109 @@ def parse_nav_yml(
     nav_file = abs_dir / ".nav.yml"
 
     if not nav_file.is_file():
-        return _nav_from_directory(docs_dir, rel_dir)
+        return _nav_from_directory(docs_dir, rel_dir, exclusions)
 
     try:
         raw = yaml.safe_load(nav_file.read_text(encoding="utf-8"))
     except yaml.YAMLError:
-        return _nav_from_directory(docs_dir, rel_dir)
+        return _nav_from_directory(docs_dir, rel_dir, exclusions)
 
     if not isinstance(raw, dict) or "nav" not in raw:
-        return _nav_from_directory(docs_dir, rel_dir)
+        return _nav_from_directory(docs_dir, rel_dir, exclusions)
 
     nav_list = raw["nav"]
     if not isinstance(nav_list, list):
-        return _nav_from_directory(docs_dir, rel_dir)
+        return _nav_from_directory(docs_dir, rel_dir, exclusions)
 
-    return _parse_nav_entries(nav_list, docs_dir, rel_dir)
+    return _parse_nav_entries(nav_list, docs_dir, rel_dir, exclusions)
 
 
 def _parse_nav_entries(
-    nav_list: list, docs_dir: Path, rel_dir: Path
+    nav_list: list,
+    docs_dir: Path,
+    rel_dir: Path,
+    exclusions: ExclusionRules | None = None,
 ) -> list[NavItem]:
     """Parse a list of .nav.yml nav entries into NavItems."""
     items: list[NavItem] = []
     for entry in nav_list:
         if isinstance(entry, dict):
             for title, target in entry.items():
-                item = _parse_nav_entry(title, target, docs_dir, rel_dir)
+                item = _parse_nav_entry(title, target, docs_dir, rel_dir, exclusions)
                 if item is not None:
                     items.append(item)
         elif isinstance(entry, str):
             # Bare string entry — use filename as title
             path = str(rel_dir / entry) if rel_dir != Path(".") else entry
+            if exclusions is not None and exclusions.is_excluded(path):
+                continue
             items.append(NavItem(title=_title_from_path(entry), path=path))
 
     return items
 
 
 def parse_mkdocs_nav(
-    nav_config: list, docs_dir: Path
+    nav_config: list,
+    docs_dir: Path,
+    exclusions: ExclusionRules | None = None,
 ) -> list[NavItem]:
     """Parse nav from mkdocs.yml (when nav is defined there instead of .nav.yml).
 
     Handles the nested dict/list structure:
     - {'Title': 'path.md'}  -> leaf
     - {'Section': [...]}    -> section with children
+
+    Excluded leaves are dropped, and a section left with no children is
+    dropped too rather than surfacing as an empty heading.
     """
     items: list[NavItem] = []
     for entry in nav_config:
         if isinstance(entry, dict):
             for title, value in entry.items():
                 if isinstance(value, str):
+                    if exclusions is not None and exclusions.is_excluded(value):
+                        continue
                     items.append(NavItem(title=title, path=value))
                 elif isinstance(value, list):
-                    children = parse_mkdocs_nav(value, docs_dir)
+                    children = parse_mkdocs_nav(value, docs_dir, exclusions)
+                    if not children and exclusions:
+                        # Every child was excluded — drop the empty section
+                        continue
                     items.append(NavItem(title=title, children=children))
         elif isinstance(entry, str):
+            if exclusions is not None and exclusions.is_excluded(entry):
+                continue
             items.append(NavItem(title=_title_from_path(entry), path=entry))
 
     return items
 
 
 def _parse_nav_entry(
-    title: str, target: str | list, docs_dir: Path, rel_dir: Path
+    title: str,
+    target: str | list,
+    docs_dir: Path,
+    rel_dir: Path,
+    exclusions: ExclusionRules | None = None,
 ) -> NavItem | None:
-    """Parse a single nav entry from .nav.yml."""
+    """Parse a single nav entry from .nav.yml.
+
+    Returns None when the entry is excluded, malformed, or resolves to a
+    section whose children were all excluded.
+    """
     if isinstance(target, list):
         # Inline list of child entries — a section defined inline rather than
         # via a subdirectory. Children share the same rel_dir as the parent.
-        children = _parse_nav_entries(target, docs_dir, rel_dir)
+        children = _parse_nav_entries(target, docs_dir, rel_dir, exclusions)
+        if not children and exclusions:
+            return None
         return NavItem(title=title, children=children)
 
     if not isinstance(target, str):
         # Unexpected shape (e.g. dict, None) — skip defensively rather than crash.
+        return None
+
+    rel_target = rel_dir / target
+    if exclusions is not None and exclusions.is_excluded(rel_target):
         return None
 
     target_path = (docs_dir / rel_dir / target)
@@ -279,30 +320,39 @@ def _parse_nav_entry(
     target_path = target_path.resolve()
 
     if target_path.is_file() and target.endswith(".md"):
-        rel_path = str(rel_dir / target)
+        rel_path = str(rel_target)
         return NavItem(title=title, path=rel_path)
 
     # Guard against symlinked directories (prevents infinite recursion from loops)
     if target_path.is_dir() and not target_path.is_symlink():
         child_rel = rel_dir / target if rel_dir != Path(".") else Path(target)
-        children = parse_nav_yml(docs_dir, child_rel)
+        children = parse_nav_yml(docs_dir, child_rel, exclusions)
         index_path = target_path / "index.md"
         section_path = None
         if index_path.is_file():
-            section_path = str(child_rel / "index.md")
+            candidate = child_rel / "index.md"
+            if exclusions is None or not exclusions.is_excluded(candidate):
+                section_path = str(candidate)
+        if not children and section_path is None and exclusions:
+            # Nothing left under this directory — drop the empty section
+            return None
         return NavItem(title=title, path=section_path, children=children)
 
     # Target doesn't exist or is a symlinked dir — include with path but don't recurse
-    rel_path = str(rel_dir / target)
+    rel_path = str(rel_target)
     return NavItem(title=title, path=rel_path)
 
 
 def _nav_from_directory(
-    docs_dir: Path, rel_dir: Path | None = None
+    docs_dir: Path,
+    rel_dir: Path | None = None,
+    exclusions: ExclusionRules | None = None,
 ) -> list[NavItem]:
     """Build navigation from directory listing (fallback when no nav config).
 
-    Lists .md files alphabetically, recurses into subdirectories.
+    Lists .md files alphabetically, recurses into subdirectories. Excluded
+    files are omitted; a directory left with no visible children produces
+    no section, so exclusions prune empty branches on their own.
     """
     if rel_dir is None:
         rel_dir = Path(".")
@@ -319,18 +369,27 @@ def _nav_from_directory(
         if entry.name.startswith("."):
             continue
 
+        child_rel = rel_dir / entry.name if rel_dir != Path(".") else Path(entry.name)
+
         if entry.is_file() and entry.suffix.lower() == ".md":
+            if exclusions is not None and exclusions.is_excluded(child_rel):
+                continue
             rel_path = str(rel_dir / entry.name) if rel_dir != Path(".") else entry.name
             items.append(NavItem(
                 title=_title_from_path(entry.name),
                 path=rel_path,
             ))
         elif entry.is_dir() and not entry.is_symlink():
-            child_rel = rel_dir / entry.name if rel_dir != Path(".") else Path(entry.name)
-            children = _nav_from_directory(docs_dir, child_rel)
+            if exclusions is not None and exclusions.is_dir_excluded(child_rel):
+                continue
+            children = _nav_from_directory(docs_dir, child_rel, exclusions)
             if children:
                 index_path = entry / "index.md"
-                section_path = str(child_rel / "index.md") if index_path.is_file() else None
+                section_path = None
+                if index_path.is_file():
+                    candidate = child_rel / "index.md"
+                    if exclusions is None or not exclusions.is_excluded(candidate):
+                        section_path = str(candidate)
                 items.append(NavItem(
                     title=_title_from_path(entry.name),
                     path=section_path,

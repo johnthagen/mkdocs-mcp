@@ -12,6 +12,7 @@ from typing import Any
 from fastmcp import Context, FastMCP
 
 from mkdocs_mcp.config import MkDocsConfig
+from mkdocs_mcp.exclusions import ExclusionRules
 from mkdocs_mcp.indexer import DocIndexer
 from mkdocs_mcp.models import (
     DocumentContent,
@@ -29,15 +30,32 @@ _MAX_READ_SIZE = 10 * 1024 * 1024  # 10 MB
 _config_path_override: str | None = None
 
 
-def _read_doc_file(path: str, docs_dir: Path) -> str | dict:
+def _read_doc_file(
+    path: str, docs_dir: Path, exclusions: ExclusionRules | None = None
+) -> str | dict:
     """Validate, size-check, and read a documentation file.
 
     Returns the raw content string on success, or an error dict on failure.
+
+    Excluded documents are refused here as well as being absent from the
+    index and nav — this is the only tool path that reads from disk rather
+    than the index, so without the check an excluded file would still be
+    readable by anyone who guessed its path. The error deliberately matches
+    the one a genuinely missing file produces, so the response does not
+    reveal that the file exists.
     """
     try:
         full_path = validate_doc_path(path, docs_dir)
     except ValueError as exc:
         return {"error": f"Invalid path: {exc}"}
+
+    if exclusions:
+        try:
+            rel = full_path.relative_to(docs_dir.resolve())
+        except ValueError:
+            return {"error": "Invalid path: File not found"}
+        if exclusions.is_excluded(rel):
+            return {"error": "Invalid path: File not found"}
 
     try:
         if full_path.stat().st_size > _MAX_READ_SIZE:
@@ -87,7 +105,7 @@ async def app_lifespan(server: FastMCP):
 
     embedder = await asyncio.to_thread(_try_load_embedder)
 
-    indexer = DocIndexer(config.docs_dir)
+    indexer = DocIndexer(config.docs_dir, exclusions=config.exclusions)
     await asyncio.to_thread(indexer.update_index, embedder)
 
     searcher = DocSearcher(indexer.db_path, embedder)
@@ -142,7 +160,7 @@ def read_document(path: str, ctx: Context) -> dict:
     """
     config: MkDocsConfig = ctx.lifespan_context["config"]
 
-    result = _read_doc_file(path, config.docs_dir)
+    result = _read_doc_file(path, config.docs_dir, config.exclusions)
     if isinstance(result, dict):
         return result
     raw_content = result
@@ -247,7 +265,7 @@ def get_document_outline(path: str, ctx: Context) -> dict:
     """
     config: MkDocsConfig = ctx.lifespan_context["config"]
 
-    result = _read_doc_file(path, config.docs_dir)
+    result = _read_doc_file(path, config.docs_dir, config.exclusions)
     if isinstance(result, dict):
         return result
     raw_content = result

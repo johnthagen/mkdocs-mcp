@@ -9,6 +9,7 @@ from typing import Any
 
 import markdown
 
+from mkdocs_mcp.exclusions import ExclusionRules
 from mkdocs_mcp.models import IndexStatus
 from mkdocs_mcp.repository import DocRepository
 from mkdocs_mcp.utils import (
@@ -25,17 +26,26 @@ logger = logging.getLogger(__name__)
 _MAX_FILE_SIZE = 10 * 1024 * 1024
 
 
-def scan_documents(docs_dir: Path) -> list[Path]:
+def scan_documents(
+    docs_dir: Path, exclusions: ExclusionRules | None = None
+) -> list[Path]:
     """Find all .md files in *docs_dir* recursively.
 
-    Skips hidden files/dirs (starting with '.') and paths that
-    escape *docs_dir* via symlinks or traversal.
+    Skips hidden files/dirs (starting with '.'), paths that escape
+    *docs_dir* via symlinks or traversal, and anything matched by
+    *exclusions*.
+
+    This is the single choke point for indexing, so filtering here keeps
+    excluded documents out of search results and document listings alike.
     """
     results: list[Path] = []
     for path in docs_dir.rglob("*.md"):
-        if any(part.startswith(".") for part in path.relative_to(docs_dir).parts):
+        rel = path.relative_to(docs_dir)
+        if any(part.startswith(".") for part in rel.parts):
             continue
         if not is_path_contained(path, docs_dir):
+            continue
+        if exclusions is not None and exclusions.is_excluded(rel):
             continue
         results.append(path)
     return sorted(results)
@@ -49,15 +59,25 @@ class DocIndexer:
     search index.
     """
 
-    def __init__(self, docs_dir: Path, db_path: Path | None = None):
+    def __init__(
+        self,
+        docs_dir: Path,
+        db_path: Path | None = None,
+        exclusions: ExclusionRules | None = None,
+    ):
         """Initialize the indexer.
 
         Args:
             docs_dir: Absolute path to the documentation directory.
             db_path: Path for the SQLite database file.
                      Defaults to docs_dir/../.mkdocs-mcp.db
+            exclusions: Patterns for documents to keep out of the index.
+                        Newly-excluded files already in the database are
+                        removed by the next ``update_index`` call, which
+                        treats them the same as deletions.
         """
         self.docs_dir = docs_dir.resolve()
+        self.exclusions = exclusions or ExclusionRules()
         self.db_path = db_path or (self.docs_dir.parent / ".mkdocs-mcp.db")
         self.repo = DocRepository(self.db_path)
         self._md = markdown.Markdown(extensions=['fenced_code', 'tables'])
@@ -72,7 +92,7 @@ class DocIndexer:
         try:
             self.repo.clear_documents()
 
-            files = scan_documents(self.docs_dir)
+            files = scan_documents(self.docs_dir, self.exclusions)
             indexed = 0
             failed = 0
 
@@ -114,7 +134,7 @@ class DocIndexer:
 
         try:
             # Get current files on disk
-            current_files = scan_documents(self.docs_dir)
+            current_files = scan_documents(self.docs_dir, self.exclusions)
             disk_paths: dict[str, Path] = {}
             for fp in current_files:
                 rel = str(fp.relative_to(self.docs_dir))
@@ -311,7 +331,7 @@ class DocIndexer:
 
         # Compare disk state against stored metadata (stat-only, no file reads)
         stored = self.repo.get_stored_metadata()
-        current_files = scan_documents(self.docs_dir)
+        current_files = scan_documents(self.docs_dir, self.exclusions)
         disk_paths: set[str] = set()
         stale = 0
         for fp in current_files:

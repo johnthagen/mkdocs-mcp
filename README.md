@@ -13,6 +13,7 @@ project structure through the Model Context Protocol.
 - **Incremental indexing** -- fast updates when files change
 - **Persistent SQLite index** that survives server restarts
 - **Navigation-aware** -- parses `mkdocs.yml` and `.nav.yml`
+- **Excludable documents** -- keep drafts and internal pages off the MCP surface
 - **Security-first** -- path traversal prevention, read-only search connections
 - **Minimal dependencies** -- 3 required, 2 optional
 
@@ -168,11 +169,64 @@ Get the heading structure (table of contents) for a document.
 
 Returns the document title and a list of headings with level, text, and anchor.
 
+## Excluding Documents
+
+Some markdown files are not worth exposing over MCP -- drafts, internal
+runbooks, generated scratch files. Add an `mcp_exclude` list to `mkdocs.yml`:
+
+```yaml
+site_name: My Docs
+
+mcp_exclude:
+  - drafts/             # any directory named 'drafts', at any depth
+  - internal/**         # anchored: only 'internal/' at the docs root
+  - "*-scratch.md"      # by filename suffix, at any depth
+  - "!internal/public.md"  # re-include one file from a broader rule
+```
+
+Exclusions apply everywhere at once. An excluded document is absent from the
+navigation tree, never enters the search index, does not appear in
+`list_documents`, and is refused by `read_document` and `get_document_outline`
+-- the refusal is identical to the response for a file that does not exist, so
+it does not reveal that the document is there.
+
+`mcp_exclude` affects only this MCP server. It does not change what `mkdocs
+build` publishes.
+
+### Pattern syntax
+
+Patterns are gitignore-style and match against a document's path relative to
+`docs_dir`.
+
+| Pattern            | Matches                                                         |
+|--------------------|-----------------------------------------------------------------|
+| `drafts/`          | Any directory named `drafts` and everything under it            |
+| `/drafts/`         | Only `drafts/` at the docs root                                 |
+| `internal/**`      | Everything under a root-level `internal/`                       |
+| `*.tmp.md`         | Files ending `.tmp.md`, at any depth                            |
+| `guide/*.md`       | `.md` files directly in `guide/` (not in subdirectories)        |
+| `guide/**/*.md`    | `.md` files anywhere under `guide/`                             |
+| `draft?.md`        | `draft1.md`, `draftx.md` -- `?` is a single character           |
+| `draft[0-9].md`    | A character class                                               |
+| `!keep/this.md`    | Re-includes a path an earlier pattern excluded                  |
+
+- A pattern containing `/` is anchored at `docs_dir`; one without it matches at
+  any depth.
+- A trailing `/` restricts a pattern to directories, so `drafts/` does not hide
+  a file named `drafts.md`.
+- Rules are evaluated in order and the **last** one to match decides, so put
+  `!` re-inclusions after the rule they carve out of.
+- Blank lines and `#` comments are ignored.
+
+Newly excluded files are dropped from the index on the next run, and removing a
+pattern brings them back -- no need to delete `.mkdocs-mcp.db`.
+
 ## Architecture
 
 ```
 src/mkdocs_mcp/
   config.py      -- MkDocs config detection and nav parsing
+  exclusions.py  -- mcp_exclude pattern matching
   repository.py  -- SQLite schema and CRUD operations
   indexer.py     -- Index orchestration with incremental updates
   searcher.py    -- Keyword, vector, and hybrid search
