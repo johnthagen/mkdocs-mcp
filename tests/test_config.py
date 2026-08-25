@@ -16,7 +16,6 @@ from mkdocs_mcp.config import (
     parse_mkdocs_nav,
     parse_nav_yml,
 )
-from mkdocs_mcp.models import NavItem
 
 
 # ---------------------------------------------------------------------------
